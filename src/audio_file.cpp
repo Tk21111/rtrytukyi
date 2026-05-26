@@ -3,6 +3,26 @@
 #include <fstream>
 #include <stdexcept>
 #include <sstream>
+#include <array>
+
+namespace {
+struct ChunkHeader {
+    char id[4];
+    uint32_t size;
+};
+
+std::string ChunkIdToString(const char id[4]) {
+    return std::string(id, 4);
+}
+
+void SkipChunkData(std::ifstream& file, uint32_t size) {
+    file.seekg(size + (size % 2), std::ios::cur);
+}
+
+void SkipBytes(std::ifstream& file, uint32_t size) {
+    file.seekg(size, std::ios::cur);
+}
+}
 
 AudioBuffer AudioFile::LoadWavFile(const std::string& filepath) {
     AudioBuffer buffer;
@@ -24,56 +44,110 @@ AudioBuffer AudioFile::LoadWavFile(const std::string& filepath) {
             throw std::runtime_error("Invalid WAV file format");
         }
         
-        // Read format chunk
-        WavFormat format;
-        file.read(reinterpret_cast<char*>(&format), sizeof(WavFormat));
-        
-        if (std::string(format.fmt, 4) != "fmt ") {
-            throw std::runtime_error("Invalid WAV format chunk");
+        WavFormat format = {};
+        uint32_t dataSize = 0;
+        std::streampos dataOffset = 0;
+        bool foundFormat = false;
+        bool foundData = false;
+
+        while (file && (!foundFormat || !foundData)) {
+            ChunkHeader chunk = {};
+            file.read(reinterpret_cast<char*>(&chunk), sizeof(chunk));
+            if (file.gcount() == 0) {
+                break;
+            }
+            if (file.gcount() != sizeof(chunk)) {
+                throw std::runtime_error("Invalid WAV chunk header");
+            }
+
+            const std::string chunkId = ChunkIdToString(chunk.id);
+
+            if (chunkId == "fmt ") {
+                if (chunk.size < 16) {
+                    throw std::runtime_error("Invalid WAV format chunk size");
+                }
+
+                format.fmt[0] = 'f';
+                format.fmt[1] = 'm';
+                format.fmt[2] = 't';
+                format.fmt[3] = ' ';
+                format.fmtSize = chunk.size;
+                file.read(reinterpret_cast<char*>(&format.audioFormat), sizeof(WavFormat) - 8);
+                if (!file) {
+                    throw std::runtime_error("Failed to read WAV format chunk");
+                }
+
+                if (chunk.size > 16) {
+                    SkipBytes(file, chunk.size - 16);
+                }
+                if (chunk.size % 2) {
+                    SkipBytes(file, 1);
+                }
+
+                foundFormat = true;
+            }
+            else if (chunkId == "data") {
+                dataSize = chunk.size;
+                dataOffset = file.tellg();
+                SkipChunkData(file, chunk.size);
+                foundData = true;
+            }
+            else {
+                LOG_INFO("Skipping WAV chunk: " + chunkId + " (" + std::to_string(chunk.size) + " bytes)");
+                SkipChunkData(file, chunk.size);
+            }
         }
-        
-        if (format.audioFormat != 1) {
-            throw std::runtime_error("Only PCM format supported");
+
+        if (!foundFormat) {
+            throw std::runtime_error("Format chunk not found");
         }
-        
-        buffer.sampleRate = format.sampleRate;
-        buffer.channels = format.channels;
-        
-        std::stringstream ss;
-        ss << "WAV Info - Rate: " << format.sampleRate 
-           << "Hz, Channels: " << format.channels 
-           << ", Bits: " << format.bitsPerSample;
-        LOG_INFO(ss.str());
-        
-        // Find data chunk
-        WavData dataChunk;
-        file.read(reinterpret_cast<char*>(&dataChunk), sizeof(WavData));
-        
-        if (std::string(dataChunk.data, 4) != "data") {
+
+        if (!foundData) {
             throw std::runtime_error("Data chunk not found");
         }
+
+        if (format.audioFormat != 1 && format.audioFormat != 3) {
+            throw std::runtime_error("Only PCM and IEEE float WAV formats supported");
+        }
+
+        buffer.sampleRate = format.sampleRate;
+        buffer.channels = format.channels;
+
+        std::stringstream ss;
+        ss << "WAV Info - Rate: " << format.sampleRate
+           << "Hz, Channels: " << format.channels
+           << ", Bits: " << format.bitsPerSample;
+        LOG_INFO(ss.str());
+
+        file.clear();
+        file.seekg(dataOffset);
         
         // Read audio data
-        uint32_t sampleCount = dataChunk.dataSize / (format.bitsPerSample / 8);
+        uint32_t sampleCount = dataSize / (format.bitsPerSample / 8);
         buffer.frameCount = sampleCount / format.channels;
         buffer.data.resize(sampleCount);
         
-        if (format.bitsPerSample == 16) {
+        if (format.audioFormat == 1 && format.bitsPerSample == 16) {
             // Read 16-bit PCM and convert to float
             std::vector<int16_t> rawData(sampleCount);
-            file.read(reinterpret_cast<char*>(rawData.data()), dataChunk.dataSize);
+            file.read(reinterpret_cast<char*>(rawData.data()), dataSize);
             
             for (size_t i = 0; i < sampleCount; ++i) {
                 buffer.data[i] = rawData[i] / 32768.0f;
             }
         }
-        else if (format.bitsPerSample == 32) {
+        else if (format.audioFormat == 3 && format.bitsPerSample == 32) {
             // Read 32-bit float directly
-            file.read(reinterpret_cast<char*>(buffer.data.data()), dataChunk.dataSize);
+            file.read(reinterpret_cast<char*>(buffer.data.data()), dataSize);
         }
         else {
-            throw std::runtime_error("Unsupported bit depth: " + 
-                                   std::to_string(format.bitsPerSample));
+            throw std::runtime_error("Unsupported WAV format: audioFormat=" +
+                                   std::to_string(format.audioFormat) +
+                                   ", bitsPerSample=" + std::to_string(format.bitsPerSample));
+        }
+
+        if (!file) {
+            throw std::runtime_error("Failed to read WAV data");
         }
         
         file.close();
