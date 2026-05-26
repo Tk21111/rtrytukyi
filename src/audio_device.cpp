@@ -1,6 +1,10 @@
+#include <windows.h>
+#include <initguid.h>
+#include <devpkey.h>
 #include "audio_device.h"
 #include "hresult_utils.h"
 #include "logger.h"
+#include <setupapi.h>
 #include <sstream>
 #include <algorithm>
 #include <cwctype>
@@ -53,6 +57,142 @@ bool ContainsBluetoothMarker(std::wstring value) {
     return value.find(L"bth") != std::wstring::npos ||
            value.find(L"bluetooth") != std::wstring::npos;
 }
+
+bool TryGetEndpointContainerId(IPropertyStore* pProps, GUID& containerId) {
+    PROPVARIANT var;
+    PropVariantInit(&var);
+
+    HRESULT hr = pProps->GetValue(PKEY_Device_ContainerId, &var);
+    LogIfFailed(hr, "Failed to read endpoint container id");
+
+    bool found = false;
+    if (SUCCEEDED(hr) && var.vt == VT_CLSID && var.puuid) {
+        containerId = *var.puuid;
+        found = true;
+    } else if (SUCCEEDED(hr) && var.vt == VT_EMPTY) {
+        LOG_INFO("PKEY_Device_ContainerId was not found on this endpoint.");
+    } else if (SUCCEEDED(hr)) {
+        LOG_INFO("Endpoint container id is not a GUID: expected VT_CLSID, got " +
+                 PropVariantTypeToString(var.vt));
+    }
+
+    PropVariantClear(&var);
+    return found;
+}
+
+std::vector<std::wstring> GetPnPDeviceInstanceIdsByContainerId(const GUID& containerId) {
+    std::vector<std::wstring> instanceIds;
+
+    HDEVINFO deviceInfoSet = SetupDiGetClassDevsW(
+        nullptr,
+        nullptr,
+        nullptr,
+        DIGCF_ALLCLASSES | DIGCF_PRESENT
+    );
+
+    if (deviceInfoSet == INVALID_HANDLE_VALUE) {
+        LOG_ERROR("Failed to enumerate PnP devices: Win32 error " + std::to_string(GetLastError()));
+        return instanceIds;
+    }
+
+    for (DWORD index = 0;; ++index) {
+        SP_DEVINFO_DATA deviceInfoData = {};
+        deviceInfoData.cbSize = sizeof(deviceInfoData);
+
+        if (!SetupDiEnumDeviceInfo(deviceInfoSet, index, &deviceInfoData)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_NO_MORE_ITEMS) {
+                LOG_ERROR("Failed while enumerating PnP devices: Win32 error " + std::to_string(error));
+            }
+            break;
+        }
+
+        DEVPROPTYPE propertyType = 0;
+        GUID deviceContainerId = {};
+        if (!SetupDiGetDevicePropertyW(
+                deviceInfoSet,
+                &deviceInfoData,
+                &DEVPKEY_Device_ContainerId,
+                &propertyType,
+                reinterpret_cast<PBYTE>(&deviceContainerId),
+                sizeof(deviceContainerId),
+                nullptr,
+                0)) {
+            continue;
+        }
+
+        if (propertyType != DEVPROP_TYPE_GUID || !IsEqualGUID(deviceContainerId, containerId)) {
+            continue;
+        }
+
+        DWORD requiredChars = 0;
+        SetupDiGetDeviceInstanceIdW(deviceInfoSet, &deviceInfoData, nullptr, 0, &requiredChars);
+        if (requiredChars == 0) {
+            continue;
+        }
+
+        std::wstring instanceId(requiredChars, L'\0');
+        if (SetupDiGetDeviceInstanceIdW(
+                deviceInfoSet,
+                &deviceInfoData,
+                instanceId.data(),
+                requiredChars,
+                nullptr)) {
+            if (!instanceId.empty() && instanceId.back() == L'\0') {
+                instanceId.pop_back();
+            }
+            instanceIds.push_back(instanceId);
+        }
+    }
+
+    SetupDiDestroyDeviceInfoList(deviceInfoSet);
+    return instanceIds;
+}
+
+bool IsEndpointInstanceId(const std::wstring& instanceId) {
+    std::wstring lower = instanceId;
+    std::transform(lower.begin(), lower.end(),
+                   lower.begin(), [](wchar_t c) { return std::towlower(c); });
+
+    return lower.rfind(L"swd\\mmdevapi\\", 0) == 0;
+}
+
+std::wstring SelectBestPnPInstanceId(const std::vector<std::wstring>& instanceIds) {
+    for (const std::wstring& instanceId : instanceIds) {
+        if (!IsEndpointInstanceId(instanceId)) {
+            return instanceId;
+        }
+    }
+
+    return instanceIds.empty() ? L"" : instanceIds.front();
+}
+
+std::vector<std::wstring> GetRelatedPnPDeviceInstanceIds(IPropertyStore* pProps) {
+    GUID containerId = {};
+    if (!TryGetEndpointContainerId(pProps, containerId)) {
+        return {};
+    }
+
+    return GetPnPDeviceInstanceIdsByContainerId(containerId);
+}
+
+std::string GetHardwareDeviceInstanceId(IMMDevice* pDevice) {
+    IPropertyStore* pProps = nullptr;
+    HRESULT hr = pDevice->OpenPropertyStore(STGM_READ, &pProps);
+    if (LogIfFailed(hr, "Failed to open device property store for hardware id")) {
+        return "";
+    }
+
+    std::vector<std::wstring> instanceIds = GetRelatedPnPDeviceInstanceIds(pProps);
+    pProps->Release();
+
+    std::wstring bestInstanceId = SelectBestPnPInstanceId(instanceIds);
+    if (bestInstanceId.empty()) {
+        return "";
+    }
+
+    return WideToUtf8(bestInstanceId);
+}
 }
 
 AudioDevice::AudioDevice() : deviceEnumerator(nullptr), comInitialized(false) {
@@ -97,18 +237,18 @@ AudioDevice::~AudioDevice() {
     LOG_INFO("Audio Device Manager shutdown");
 }
 
-bool AudioDevice::IsBluetoothDevice(IMMDevice* device) {
+bool AudioDevice::IsBluetoothDevice(IMMDevice* pDevice) {
     try {
-        IPropertyStore* props = nullptr;
-        HRESULT hr = device->OpenPropertyStore(STGM_READ, &props);
+        IPropertyStore* pProps = NULL;
+        HRESULT hr = pDevice->OpenPropertyStore(STGM_READ, &pProps);
         if (LogIfFailed(hr, "Failed to open device property store")) return false;
-        
+
         bool isBluetooth = false;
         PROPVARIANT var;
         PropVariantInit(&var);
         
         // 1. Check InstanceId for Bluetooth indicators (bthenum, bthhf, bthle, etc.)
-        hr = props->GetValue(PKEY_Device_InstanceId, &var);
+        hr = pProps->GetValue(PKEY_Device_InstanceId, &var);
         LogIfFailed(hr, "Failed to read device instance id");
         if (SUCCEEDED(hr) && var.vt == VT_LPWSTR) {
             std::wstring instanceId(var.pwszVal);
@@ -116,17 +256,31 @@ bool AudioDevice::IsBluetoothDevice(IMMDevice* device) {
             if (ContainsBluetoothMarker(instanceId)) {
                 isBluetooth = true;
             }
+        } else if (SUCCEEDED(hr) && var.vt == VT_EMPTY) {
+            LOG_INFO("PKEY_Device_InstanceId was not found on this endpoint; "
+                     "GetValue returned S_OK with VT_EMPTY, using IMMDevice::GetId fallback.");
         } else if (SUCCEEDED(hr)) {
             LOG_INFO("Device instance id is not a string: expected VT_LPWSTR, got " +
-                     PropVariantTypeToString(var.vt) +
-                     ". HRESULT succeeded, so this property is missing or empty on this endpoint.");
+                     PropVariantTypeToString(var.vt));
         }
         PropVariantClear(&var);
 
-        // 2. Fallback: Check the endpoint ID if InstanceId didn't match.
+        // 2. Fallback: Check related PnP devices from the endpoint container.
+        if (!isBluetooth) {
+            std::vector<std::wstring> relatedInstanceIds = GetRelatedPnPDeviceInstanceIds(pProps);
+            for (const std::wstring& instanceId : relatedInstanceIds) {
+                LOG_INFO("Related PnP device instance id: " + WideToUtf8(instanceId));
+                if (ContainsBluetoothMarker(instanceId)) {
+                    isBluetooth = true;
+                    break;
+                }
+            }
+        }
+
+        // 3. Fallback: Check the opaque endpoint ID if the PnP lookup didn't match.
         if (!isBluetooth) {
             LPWSTR deviceId = nullptr;
-            hr = device->GetId(&deviceId);
+            hr = pDevice->GetId(&deviceId);
             LogIfFailed(hr, "Failed to get endpoint id for Bluetooth fallback");
             if (SUCCEEDED(hr) && deviceId) {
                 std::wstring endpointId(deviceId);
@@ -135,9 +289,9 @@ bool AudioDevice::IsBluetoothDevice(IMMDevice* device) {
             }
         }
 
-        // 3. Fallback: Check FriendlyName if IDs didn't match
+        // 4. Fallback: Check FriendlyName if IDs didn't match
         if (!isBluetooth) {
-            hr = props->GetValue(PKEY_Device_FriendlyName, &var);
+            hr = pProps->GetValue(PKEY_Device_FriendlyName, &var);
             LogIfFailed(hr, "Failed to read device friendly name for Bluetooth fallback");
             if (SUCCEEDED(hr) && var.vt == VT_LPWSTR) {
                 std::wstring friendlyName(var.pwszVal);
@@ -152,7 +306,7 @@ bool AudioDevice::IsBluetoothDevice(IMMDevice* device) {
             PropVariantClear(&var);
         }
         
-        props->Release();
+        pProps->Release();
         return isBluetooth;
     }
     catch (...) {
@@ -237,29 +391,32 @@ std::vector<BluetoothSpeaker> AudioDevice::GetBluetoothSpeakers() {
         LOG_INFO("Found " + std::to_string(deviceCount) + " total audio devices");
         
         for (UINT i = 0; i < deviceCount; ++i) {
-            IMMDevice* device = nullptr;
-            hr = deviceCollection->Item(i, &device);
+            IMMDevice* pDevice = nullptr;
+            hr = deviceCollection->Item(i, &pDevice);
             
             if (LogIfFailed(hr, "Failed to get audio endpoint item")) {
                 continue;
             }
 
-            if (device) {
+            if (pDevice) {
 
-                if (IsBluetoothDevice(device)) {
+                if (IsBluetoothDevice(pDevice)) {
                     BluetoothSpeaker speaker;
-                    speaker.device = device;
-                    speaker.name = GetDeviceName(device);
-                    speaker.isActive = IsDeviceReady(device);
+                    speaker.device = pDevice;
+                    speaker.name = GetDeviceName(pDevice);
+                    speaker.isActive = IsDeviceReady(pDevice);
                     
                     // Get device ID
-                    LPWSTR deviceId = nullptr;
-                    hr = device->GetId(&deviceId);
-                    LogIfFailed(hr, "Failed to get device id");
-                    if (SUCCEEDED(hr)) {
-                        std::wstring wid(deviceId);
-                        speaker.id = WideToUtf8(wid);
-                        CoTaskMemFree(deviceId);
+                    speaker.id = GetHardwareDeviceInstanceId(pDevice);
+                    if (speaker.id.empty()) {
+                        LPWSTR deviceId = nullptr;
+                        hr = pDevice->GetId(&deviceId);
+                        LogIfFailed(hr, "Failed to get device id");
+                        if (SUCCEEDED(hr) && deviceId) {
+                            std::wstring wid(deviceId);
+                            speaker.id = WideToUtf8(wid);
+                            CoTaskMemFree(deviceId);
+                        }
                     }
                     
                     speakers.push_back(speaker);
@@ -270,7 +427,7 @@ std::vector<BluetoothSpeaker> AudioDevice::GetBluetoothSpeakers() {
                     LOG_INFO(ss.str());
                 }
                 else {
-                    device->Release();
+                    pDevice->Release();
                 }
             }
         }
