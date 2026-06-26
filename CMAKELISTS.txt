@@ -4,19 +4,21 @@ project(bluetooth_speaker_sync)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Create directories
 file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/test/sound")
 file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/log")
 
 add_executable(bluetooth_sync
-    src/main.cpp
+    src/test_sync.cpp
     src/audio_device.cpp
     src/audio_file.cpp
+    src/mic_capture.cpp
+    src/pulse_generator.cpp
+    src/pulse_detector.cpp
     src/hresult_utils.cpp
     src/logger.cpp
+    external/kissfft/kiss_fft.c          
 )
 
-# Link Windows multimedia libraries
 target_link_libraries(bluetooth_sync
     PRIVATE
     ole32
@@ -26,12 +28,17 @@ target_link_libraries(bluetooth_sync
     winmm
 )
 
-# Set output directory
+target_include_directories(bluetooth_sync
+    PRIVATE
+    "${CMAKE_SOURCE_DIR}/external/kissfft"
+)
+
+target_compile_definitions(bluetooth_sync PRIVATE NOMINMAX)
+
 set_target_properties(bluetooth_sync PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Copy test file if it exists (optional)
 if(EXISTS "${CMAKE_SOURCE_DIR}/test/sound/test1.wav")
     add_custom_command(TARGET bluetooth_sync POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
