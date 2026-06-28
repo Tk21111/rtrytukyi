@@ -577,3 +577,32 @@ bool AudioDevice::SendAudioToSpeaker(const BluetoothSpeaker& speaker,
         return false;
     }
 }
+
+
+IMMDevice* AudioDevice::GetSpeakerByName(const std::string& nameContains) {
+    IMMDeviceCollection* collection = nullptr;
+    HRESULT hr = deviceEnumerator->EnumAudioEndpoints(
+        eRender, DEVICE_STATE_ACTIVE, &collection);
+    if (LogIfFailed(hr, "GetSpeakerByName: enum failed")) return nullptr;
+
+    UINT count = 0;
+    collection->GetCount(&count);
+
+    for (UINT i = 0; i < count; ++i) {
+        IMMDevice* pDevice = nullptr;
+        collection->Item(i, &pDevice);
+        if (!pDevice) continue;
+
+        std::string name = GetDeviceName(pDevice);
+        if (name.find(nameContains) != std::string::npos) {
+            LOG_INFO("GetSpeakerByName: found → " + name);
+            collection->Release();
+            return pDevice;
+        }
+        pDevice->Release();
+    }
+
+    collection->Release();
+    LOG_ERROR("GetSpeakerByName: not found → " + nameContains);
+    return nullptr;
+}

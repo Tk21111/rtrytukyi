@@ -35,7 +35,7 @@ float PulseDetector::GetMagnitudeAtFreq(
 
     // which bin is our target frequency?
     int targetBin = static_cast<int>(targetFreq * count / sampleRate);
-    targetBin = (std::min)(targetBin, count / 2 - 1);
+    targetBin = std::min(targetBin, count / 2 - 1);
 
     float r = out[targetBin].r;
     float im = out[targetBin].i;
@@ -47,22 +47,18 @@ std::optional<DetectionResult> PulseDetector::DetectFirstArrival(
     float targetFreq,
     float threshold)
 {
-    LOG_INFO("Scanning for pulse at " + std::to_string(targetFreq) + "Hz");
-
-    LARGE_INTEGER freq, startCounter;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&startCounter);
+    LOG_INFO("Scanning for pulse at " + std::to_string(targetFreq) + "Hz, threshold: " + std::to_string(threshold));
 
     int totalFrames = static_cast<int>(micBuffer.frameCount);
-    int step        = windowSize / 2;   // 50% overlap between windows
+    int step        = windowSize / 2;
+    float maxMagnitudeSeen = 0.0f;  // ← track this
 
     for (int offset = 0; offset + windowSize <= totalFrames; offset += step) {
         const float* window = micBuffer.data.data() + offset * micBuffer.channels;
 
-        // mono-ify if stereo — just take channel 0
         std::vector<float> mono(windowSize);
         for (int i = 0; i < windowSize; ++i) {
-            mono[i] = window[i * micBuffer.channels];  // channel 0
+            mono[i] = window[i * micBuffer.channels];
         }
 
         float magnitude = GetMagnitudeAtFreq(
@@ -70,21 +66,24 @@ std::optional<DetectionResult> PulseDetector::DetectFirstArrival(
             targetFreq, static_cast<float>(micBuffer.sampleRate)
         );
 
-        if (magnitude >= threshold) {
-            // convert sample offset → milliseconds
-            double offsetMs = (static_cast<double>(offset) / micBuffer.sampleRate) * 1000.0;
+        if (magnitude > maxMagnitudeSeen) maxMagnitudeSeen = magnitude;
 
+        if (magnitude >= threshold) {
+            double offsetMs = (static_cast<double>(offset) / micBuffer.sampleRate) * 1000.0;
             DetectionResult result;
             result.timestampMs = static_cast<uint64_t>(offsetMs);
             result.amplitude   = magnitude;
-
             LOG_INFO("Pulse detected at " + std::to_string(offsetMs) +
                      "ms, magnitude: " + std::to_string(magnitude));
             return result;
         }
     }
 
-    LOG_INFO("No pulse detected above threshold " + std::to_string(threshold));
+    // ← tells you exactly how far off threshold you are
+    LOG_INFO("No pulse detected. Max magnitude seen: " + std::to_string(maxMagnitudeSeen) +
+             " vs threshold: " + std::to_string(threshold));
+    std::cout << "  [DEBUG] max magnitude at " << (int)targetFreq 
+              << "Hz: " << maxMagnitudeSeen << " (threshold: " << threshold << ")\n";
     return std::nullopt;
 }
 

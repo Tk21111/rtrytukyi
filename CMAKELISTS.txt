@@ -8,7 +8,9 @@ file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/test/sound")
 file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/log")
 
 add_executable(bluetooth_sync
-    src/test_sync.cpp
+    src/test_pulse.cpp
+    # src/test_play.cpp
+    # src/test_sync.cpp //not test yet
     src/audio_device.cpp
     src/audio_file.cpp
     src/mic_capture.cpp

@@ -11,6 +11,7 @@ public:
 
     // capture audio for durationMs milliseconds, returns filled AudioBuffer
     AudioBuffer Capture(uint32_t durationMs);
+    IMMDevice* FindMicByName(const std::string& nameContains);
 
 private:
     IMMDeviceEnumerator* deviceEnumerator;
