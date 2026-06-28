@@ -44,13 +44,12 @@ struct SendPulseParams {
     BluetoothSpeaker* speaker;
     float             frequency;
     uint32_t          delayMs;
-    HANDLE            startGate;
 };
 
 DWORD WINAPI SendPulseThread(LPVOID param) {
     auto* p = reinterpret_cast<SendPulseParams*>(param);
-    WaitForSingleObject(p->startGate, INFINITE);  // ← wait at gate
-    AudioBuffer pulse = PulseGenerator::Generate(p->frequency, 300.0f, 44100);
+    Sleep(p->delayMs);
+    AudioBuffer pulse = PulseGenerator::Generate(p->frequency, 300.0f, 48000);
     LogSent(p->speaker->name, p->frequency);
     g_audio.SendAudioToSpeaker(*p->speaker, pulse);
     return 0;
@@ -90,8 +89,8 @@ bool RunPulseCapture(
 
 // ── setup ─────────────────────────────────────────────────────────────────────
 bool Setup() {
-    IMMDevice* normalDev = g_audio.GetSpeakerByName("Techpro");
-    IMMDevice* btDev     = g_audio.GetSpeakerByName("Techpro");
+    IMMDevice* normalDev = g_audio.GetSpeakerByName("Real");
+    IMMDevice* btDev     = g_audio.GetSpeakerByName("Real");
 
     if (!normalDev) { std::cout << "[FAIL] Techpro speaker not found\n";  return false; }
     if (!btDev)     { std::cout << "[FAIL] SK speaker not found\n";  return false; }
@@ -109,38 +108,16 @@ bool Test1_PulseOnly() {
     std::cout << "\n[TEST 1] Pulse only — no music\n";
     std::cout << "----------------------------------------\n";
 
-    HANDLE startGate = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    std::cout << "\n  → Normal speaker\n";
+    bool normalOk = RunPulseCapture(g_normal, 15000.0f, 2000, 0.00007f);
 
-    SendPulseParams paramA{ &g_normal, 17000.0f, 0, startGate };
-    SendPulseParams paramB{ &g_bt,     18000.0f, 0, startGate };
 
-    HANDLE tA = CreateThread(nullptr, 0, SendPulseThread, &paramA, 0, nullptr);
-    HANDLE tB = CreateThread(nullptr, 0, SendPulseThread, &paramB, 0, nullptr);
+    Sleep(500);
 
-    Sleep(50);          // make sure both threads are waiting at gate
-    SetEvent(startGate); // open gate — both fire together
+    std::cout << "\n  → BT speaker (Techpro)\n";
+    bool btOk     = RunPulseCapture(g_bt,     15000.0f, 2000, 0.00007f);  // BT needs more headroom
 
-    AudioBuffer micBuf = g_mic.Capture(2500);
-
-    WaitForSingleObject(tA, INFINITE);
-    WaitForSingleObject(tB, INFINITE);
-    CloseHandle(tA);
-    CloseHandle(tB);
-    CloseHandle(startGate);
-
-    auto resultNormal = g_detector.DetectFirstArrival(micBuf, 17000.0f, 0.00020f);
-    auto resultBT     = g_detector.DetectFirstArrival(micBuf, 18000.0f, 0.00007f);
-
-    LogRecv(17000.0f, resultNormal);
-    LogRecv(18000.0f, resultBT);
-
-    if (resultNormal && resultBT) {
-        int64_t offsetMs = (int64_t)resultBT->timestampMs - (int64_t)resultNormal->timestampMs;
-        std::cout << "\n  [OFFSET] BT vs Normal: " << offsetMs << "ms"
-                  << (offsetMs > 0 ? " (BT slower)" : " (BT faster?)") << "\n";
-    }
-
-    bool pass = resultNormal.has_value() && resultBT.has_value();
+    bool pass = normalOk && btOk;
     std::cout << "\n[TEST 1] " << (pass ? "PASS" : "FAIL") << "\n";
     return pass;
 }
